@@ -240,12 +240,71 @@ fn append_tree(b: &mut tar::Builder<impl Write>, src: &std::path::Path, name: &s
         if meta.is_dir() && src != std::path::Path::new("/proc") && src != std::path::Path::new("/sys") {
             let mut children: Vec<_> = fs::read_dir(&src)?.flatten().collect();
             children.sort_by_key(|e| e.file_name());
+            // Batch independent reads, keeping one ordered writer for the tar stream.
+            if children.len() >= 48 && children.iter().all(|e| e.file_type().is_ok_and(|t| t.is_file())) {
+                append_files(b, &children, &name)?;
+                continue;
+            }
             for e in children.into_iter().rev() {
                 stack.push((e.path(), name.join(e.file_name())));
             }
         }
     }
     Ok(())
+}
+
+fn append_files(b: &mut tar::Builder<impl Write>, files: &[fs::DirEntry], parent: &std::path::Path) -> io::Result<()> {
+    const WORKERS: usize = 6;
+    std::thread::scope(|scope| {
+        // Each lane holds at most two file bodies (queued and in flight).
+        // Dropping the receivers on a write error also releases blocked senders.
+        let mut lanes = Vec::with_capacity(WORKERS);
+        for lane in 0..WORKERS {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            scope.spawn(move || {
+                for entry in files.iter().skip(lane).step_by(WORKERS) {
+                    if tx.send(prefetch(&entry.path())).is_err() {
+                        break;
+                    }
+                }
+            });
+            lanes.push(rx);
+        }
+        for (i, entry) in files.iter().enumerate() {
+            let (meta, data) = lanes[i % WORKERS].recv().map_err(io::Error::other)??;
+            let name = parent.join(entry.file_name());
+            if let Some(data) = data {
+                let mut h = tar::Header::new_gnu();
+                h.set_metadata(&meta);
+                b.append_data(&mut h, name, data.as_slice())?;
+            } else if meta.is_dir() {
+                append_tree(b, &entry.path(), &name)?;
+            } else {
+                append_one(b, &entry.path(), &name, &meta)?;
+            }
+        }
+        Ok(())
+    })
+}
+
+fn prefetch(path: &std::path::Path) -> io::Result<(fs::Metadata, Option<Vec<u8>>)> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let meta = fs::symlink_metadata(path)?;
+    if !meta.is_file() || meta.len() > 16 * 1024 {
+        return Ok((meta, None));
+    }
+    let mut file = fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file() || opened.dev() != meta.dev() || opened.ino() != meta.ino() {
+        return Err(io::Error::other("file replaced during copy"));
+    }
+    if opened.len() > 16 * 1024 {
+        return Ok((opened, None));
+    }
+    let mut data = vec![0; opened.len() as usize];
+    file.read_exact(&mut data)?;
+    Ok((opened, Some(data)))
 }
 
 fn append_one(b: &mut tar::Builder<impl Write>, src: &std::path::Path, name: &std::path::Path, meta: &fs::Metadata) -> io::Result<()> {
