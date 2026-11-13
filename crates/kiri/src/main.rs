@@ -78,6 +78,7 @@ mod update;
 const USAGE: &str = "\
 usage: kiri COMMAND          docker's commands, on Kiri: kiri run, ps, exec,
                              logs, stop, rm, images, pull, build, compose…
+       kiri exec --bind-read CONTAINER COMMAND [ARG...]   pin a serial reader to CPU 0
        kiri daemon
        kiri bridge [--socket PATH]   (WSL2: the end of kiri-win.exe)
        kiri ui [--start] [--view containers|images|volumes|networks]
@@ -172,6 +173,11 @@ fn main() -> ExitCode {
         // The static engine has no window: the package's own build of it.
         #[cfg(all(target_os = "linux", not(feature = "window")))]
         Some("ui") => window(&args),
+        #[cfg(any(unix, windows))]
+        Some("exec") if args.get(1).is_some_and(|arg| arg == "--bind-read") => {
+            engine_version_check();
+            docker::bind_read(&args[2..])
+        }
         #[cfg(any(unix, windows))]
         Some(c) if docker::handles(c) => {
             engine_version_check();

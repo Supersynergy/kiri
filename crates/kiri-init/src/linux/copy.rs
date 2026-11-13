@@ -233,19 +233,101 @@ fn copy_out(conn: &mut fs::File, spec: &CopySpec<'_>) -> io::Result<()> {
 /// Like `append_dir_all`, but sockets (which tar cannot hold) are skipped,
 /// and the kernel's /proc and /sys archive as empty directories.
 fn append_tree(b: &mut tar::Builder<impl Write>, src: &std::path::Path, name: &std::path::Path) -> io::Result<()> {
-    let mut stack = vec![(src.to_path_buf(), name.to_path_buf())];
-    while let Some((src, name)) = stack.pop() {
-        let meta = fs::symlink_metadata(&src)?;
-        append_one(b, &src, &name, &meta)?;
-        if meta.is_dir() && src != std::path::Path::new("/proc") && src != std::path::Path::new("/sys") {
-            let mut children: Vec<_> = fs::read_dir(&src)?.flatten().collect();
-            children.sort_by_key(|e| e.file_name());
-            for e in children.into_iter().rev() {
-                stack.push((e.path(), name.join(e.file_name())));
+    use std::collections::VecDeque;
+    use std::path::{Path, PathBuf};
+    use std::sync::mpsc;
+
+    const WORKERS: usize = 8;
+    const WINDOW: usize = WORKERS * 2;
+
+    std::thread::scope(|scope| {
+        type Lane = (mpsc::Sender<PathBuf>, mpsc::Receiver<(PathBuf, io::Result<(fs::Metadata, Option<Vec<u8>>)>)>);
+        let mut lanes: Vec<Lane> = Vec::with_capacity(WORKERS);
+        // Keep one ordered writer. WINDOW bounds all queued, running and
+        // completed reads combined, independently of the directory size.
+        let mut pending = VecDeque::new();
+        let write_next = |pending: &mut VecDeque<(usize, PathBuf)>, b: &mut tar::Builder<_>, lanes: &[Lane]| -> io::Result<()> {
+            let (lane, name) = pending.pop_front().expect("pending archive entry");
+            let (path, result) = lanes[lane].1.recv().map_err(io::Error::other)?;
+            let (meta, data) = result?;
+            if let Some(data) = data {
+                let mut header = tar::Header::new_gnu();
+                header.set_metadata(&meta);
+                b.append_data(&mut header, name, data.as_slice())?;
+            } else if meta.is_dir() {
+                // A file changed type after readdir.
+                append_tree(b, &path, &name)?;
+            } else {
+                append_one(b, &path, &name, &meta)?;
+            }
+            Ok(())
+        };
+        let mut lane = 0;
+        let mut stack = vec![(src.to_path_buf(), name.to_path_buf(), false)];
+        while let Some((src, name, regular)) = stack.pop() {
+            if regular && !lanes.is_empty() {
+                lanes[lane].0.send(src).map_err(io::Error::other)?;
+                pending.push_back((lane, name));
+                lane = (lane + 1) % WORKERS;
+                if pending.len() == WINDOW {
+                    write_next(&mut pending, b, &lanes)?;
+                }
+                continue;
+            }
+            while !pending.is_empty() {
+                write_next(&mut pending, b, &lanes)?;
+            }
+            let meta = fs::symlink_metadata(&src)?;
+            append_one(b, &src, &name, &meta)?;
+            if meta.is_dir() && src != Path::new("/proc") && src != Path::new("/sys") {
+                let mut children: Vec<_> = fs::read_dir(&src)?.collect::<io::Result<_>>()?;
+                if lanes.is_empty() && children.len() >= WORKERS {
+                    for _ in 0..WORKERS {
+                        let (jobs, inbox) = mpsc::channel::<PathBuf>();
+                        let (results, outbox) = mpsc::channel();
+                        std::thread::Builder::new().spawn_scoped(scope, move || {
+                            for path in inbox {
+                                let result = prefetch(&path);
+                                if results.send((path, result)).is_err() {
+                                    break;
+                                }
+                            }
+                        })?;
+                        lanes.push((jobs, outbox));
+                    }
+                }
+                children.sort_by_cached_key(|entry| entry.file_name());
+                for entry in children.into_iter().rev() {
+                    let regular = entry.file_type()?.is_file();
+                    stack.push((entry.path(), name.join(entry.file_name()), regular));
+                }
             }
         }
+        while !pending.is_empty() {
+            write_next(&mut pending, b, &lanes)?;
+        }
+        Ok(())
+    })
+}
+
+fn prefetch(path: &std::path::Path) -> io::Result<(fs::Metadata, Option<Vec<u8>>)> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let meta = fs::symlink_metadata(path)?;
+    if !meta.is_file() || meta.len() > 16 * 1024 {
+        return Ok((meta, None));
     }
-    Ok(())
+    let mut file = fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file() || opened.dev() != meta.dev() || opened.ino() != meta.ino() {
+        return Err(io::Error::other("file replaced during copy"));
+    }
+    if opened.len() > 16 * 1024 {
+        return Ok((opened, None));
+    }
+    let mut data = vec![0; opened.len() as usize];
+    file.read_exact(&mut data)?;
+    Ok((opened, Some(data)))
 }
 
 fn append_one(b: &mut tar::Builder<impl Write>, src: &std::path::Path, name: &std::path::Path, meta: &fs::Metadata) -> io::Result<()> {
