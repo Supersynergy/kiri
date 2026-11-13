@@ -22,6 +22,25 @@ pub fn handles(command: &str) -> bool {
     COMMANDS.contains(&command)
 }
 
+/// The opt-in is recognized only immediately after `exec`, before the
+/// container. Docker and the guest receive separate arguments throughout.
+pub fn bind_read(args: &[String]) -> io::Result<()> {
+    const USAGE: &str = "usage: kiri exec --bind-read CONTAINER COMMAND [ARG...] (requires taskset and CPU 0 in the container)";
+    if args == ["--help"] {
+        println!("{USAGE}");
+        return Ok(());
+    }
+    let [container, program, arguments @ ..] = args else {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, USAGE));
+    };
+    if container.is_empty() || container.starts_with('-') || program.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, USAGE));
+    }
+    let mut command = vec!["exec".into(), "--".into(), container.clone(), "taskset".into(), "-c".into(), "--".into(), "0".into(), program.clone()];
+    command.extend_from_slice(arguments);
+    run(&command)
+}
+
 /// Replaces this process with `docker <args>`, so the terminal, signals and
 /// the exit code are docker's own. Returns only if that fails.
 #[cfg(unix)]

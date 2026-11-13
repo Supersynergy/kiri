@@ -52,6 +52,12 @@ Kiri's socket. (`kiri import` is Kiri's own: it brings images, volumes and
 containers over from OrbStack or Docker Desktop.) The daemon-free tools
 that boot their own guest are `kiri raw run|pull|images|rmi`.
 
+For serial reads of many small host-mounted files, use
+`kiri exec --bind-read CONTAINER COMMAND [ARG...]`. The Linux image must provide
+`taskset` and the container must have access to CPU 0. The command and its
+children inherit the affinity for that invocation. Use regular `kiri exec`
+for parallel workloads or Docker exec options.
+
 `kiri` keeps its data in `~/Library/Application Support/Kiri` (override with
 `KIRI_DATA_DIR`). It does not touch `/usr/local/bin/docker`.
 `/var/run/docker.sock` changes only when you ask: `kiri setup --docker-socket`
